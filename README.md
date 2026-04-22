@@ -41,15 +41,31 @@ git clone https://github.com/Digitous/LLM-SLERP-Merge.git
 ```bash
 cd LLM-SLERP-Merge
 ```
-3. (Optional) Ensure you have the proper dependencies: numpy, torch, transformers, tkinter, and colorama; you can install them using:
+3. (Optional) Ensure you have the proper dependencies: numpy, torch, transformers, and colorama; you can install them using:
 ```bash
 pip install -r requirements.txt
 ```
-4. Run the SLERP script.
+4. Run the SLERP script from command line (no tkinter required). You can pass local paths or Hugging Face model IDs.
 ```bash
-python slerpmergelm.py
+python3 slerpmergelm.py \
+  --primary-model meta-llama/Llama-2-7b-hf \
+  --secondary-model mistralai/Mistral-7B-v0.1 \
+  --output-dir /path/to/output_model \
+  --t 0.5
 ```
-5. Follow the on-screen prompts to select the primary model, secondary model, and the directory to save the blended model. Ensure parent models are of the same architecture and parameter size (for example both LLaMa2 13B pretrained language models). The script will do the rest, spherical merging both parent models and saving the offspring model to the selected save directory. For added convenience, it will also scan both parent directories to see if one has a special_tokens_map.json and will proceed to copy all relevant tokenizer files from there to the child directory (in case both or neither contains the special_tokens_map, it will still copy necessary files to the child dir providing a model instantly ready to use when the process is complete).
+For private/gated Hugging Face repos, pass a token:
+```bash
+python3 slerpmergelm.py \
+  --primary-model your-org/private-model-a \
+  --secondary-model your-org/private-model-b \
+  --output-dir /path/to/output_model \
+  --hf-token hf_xxxxxxxxxxxxxxxxx
+```
+5. You can also run without arguments and provide paths interactively in terminal prompts:
+```bash
+python3 slerpmergelm.py
+```
+Ensure parent models are of the same architecture and parameter size (for example both LLaMa2 13B pretrained language models). The script accepts HF/PyTorch model weights in both `.bin` and `.safetensors` formats, then performs spherical merging and saves the offspring model to the selected save directory. For added convenience, it will also scan both parent directories to see if one has a special_tokens_map.json and will proceed to copy all relevant tokenizer files from there to the child directory (in case both or neither contains the special_tokens_map, it will still copy necessary files to the child dir providing a model instantly ready to use when the process is complete).
 
 ---
 

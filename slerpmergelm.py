@@ -13,19 +13,21 @@ from transformers import AutoModelForCausalLM, AutoConfig
 import subprocess
 import os
 import shutil
-import tkinter as tk
-from tkinter import filedialog
+import argparse
+import json
+from huggingface_hub import snapshot_download
+from safetensors.torch import load_file as load_safetensors_file
 from colorama import init, Fore, Style
 
 newline = '\n'
+
+
 def clear_console():
     if os.name == "nt":  # For Windows
         subprocess.call("cls", shell=True)
     else:  # For Linux and macOS
         subprocess.call("clear", shell=True)
 
-clear_console()
-print(f"{Fore.YELLOW}Starting {Fore.GREEN}spherical linear interpolation{Fore.YELLOW} script, please wait...{Style.RESET_ALL}")
 
 def lerp(t, v0, v1):
     return (1 - t) * v0 + t * v1
@@ -97,18 +99,135 @@ def load_sharded_model(path):
         state_dict.update(shard)
     return {'state_dict': state_dict}
 
-def select_path(title):
-    root = tk.Tk()
-    root.withdraw()
-    path = filedialog.askdirectory(title=title)
-    return path
+
+def load_sharded_safetensors_model(path):
+    state_dict = {}
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        shard_paths = sorted(set(index_data.get("weight_map", {}).values()))
+    else:
+        shard_paths = sorted(
+            [
+                f
+                for f in os.listdir(path)
+                if f.startswith("model-") and f.endswith(".safetensors")
+            ]
+        )
+
+    for shard_path in shard_paths:
+        shard = load_safetensors_file(os.path.join(path, shard_path), device="cpu")
+        state_dict.update(shard)
+    return {'state_dict': state_dict}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Merge two Hugging Face causal LMs with SLERP via command line."
+    )
+    parser.add_argument(
+        "--primary-model",
+        type=str,
+        help="Path to the first (primary) model directory OR Hugging Face model id.",
+    )
+    parser.add_argument(
+        "--secondary-model",
+        type=str,
+        help="Path to the second (secondary) model directory OR Hugging Face model id.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        help="Directory where the merged model will be saved.",
+    )
+    parser.add_argument(
+        "--t",
+        type=float,
+        default=0.5,
+        help="SLERP interpolation factor (0.0 = primary model, 1.0 = secondary model). Default: 0.5",
+    )
+    parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Do not clear the terminal before running.",
+    )
+    parser.add_argument(
+        "--hf-token",
+        type=str,
+        default=None,
+        help="Optional Hugging Face token for private/gated models. If omitted, uses HF_TOKEN/HUGGINGFACE_HUB_TOKEN env vars or local login.",
+    )
+    return parser.parse_args()
+
+
+def prompt_for_model_source(label):
+    while True:
+        source = input(f"{label} (local path or HF repo id): ").strip().strip('"').strip("'")
+        if source:
+            return source
+        print("Value cannot be empty. Please try again.")
+
+
+def resolve_hf_token(cli_token):
+    if cli_token:
+        return cli_token
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+
+
+def resolve_model_source(source, hf_token=None):
+    source = source.strip().strip('"').strip("'")
+    if os.path.isdir(source):
+        return os.path.abspath(source)
+
+    print(f"Resolving Hugging Face model id: {source}")
+    downloaded_path = snapshot_download(repo_id=source, token=hf_token)
+    return downloaded_path
+
+
+def resolve_input_paths(args):
+    primary_model_source = args.primary_model
+    secondary_model_source = args.secondary_model
+    blended_model_savedir = args.output_dir
+
+    if not primary_model_source:
+        primary_model_source = prompt_for_model_source("Enter first model")
+    if not secondary_model_source:
+        secondary_model_source = prompt_for_model_source("Enter second model")
+    if not blended_model_savedir:
+        blended_model_savedir = input("Enter path to save the blended model: ").strip().strip('"').strip("'")
+
+    hf_token = resolve_hf_token(args.hf_token)
+    primary_model_path = resolve_model_source(primary_model_source, hf_token=hf_token)
+    secondary_model_path = resolve_model_source(secondary_model_source, hf_token=hf_token)
+    blended_model_savedir = os.path.abspath(blended_model_savedir)
+    if not os.path.isdir(primary_model_path):
+        raise ValueError(f"Unable to resolve primary model directory from: {primary_model_source}")
+    if not os.path.isdir(secondary_model_path):
+        raise ValueError(f"Unable to resolve secondary model directory from: {secondary_model_source}")
+
+    if os.path.exists(blended_model_savedir) and not os.path.isdir(blended_model_savedir):
+        raise ValueError(f"Output path exists and is not a directory: {blended_model_savedir}")
+
+    os.makedirs(blended_model_savedir, exist_ok=True)
+    return primary_model_path, secondary_model_path, blended_model_savedir
 
 def load_model(path):
     if os.path.exists(os.path.join(path, 'pytorch_model.bin')):
         state_dict = torch.load(os.path.join(path, 'pytorch_model.bin'), map_location='cpu')
         return {'state_dict': state_dict}
-    else:
+    if any(f.startswith("pytorch_model-") and f.endswith(".bin") for f in os.listdir(path)):
         return load_sharded_model(path)
+    if os.path.exists(os.path.join(path, "model.safetensors")):
+        state_dict = load_safetensors_file(os.path.join(path, "model.safetensors"), device="cpu")
+        return {'state_dict': state_dict}
+    if any(f.startswith("model-") and f.endswith(".safetensors") for f in os.listdir(path)) or os.path.exists(
+        os.path.join(path, "model.safetensors.index.json")
+    ):
+        return load_sharded_safetensors_model(path)
+    raise FileNotFoundError(
+        f"Could not find model weights in {path}. Supported files: pytorch_model*.bin and model*.safetensors"
+    )
 
 def save_model(model, path):
     torch.save(model, path)
@@ -153,73 +272,103 @@ def pad_state_dicts_with_different_tensors(primary_state_dict, secondary_state_d
         secondary_vocab_size = secondary_state_dict['model.embed_tokens.weight'].size(0)
         assert primary_vocab_size == secondary_vocab_size, "Vocab sizes do not match even after padding!"
 
-primary_model_path = select_path("Select the first model")
-secondary_model_path = select_path("Select the second model")
-blended_model_savedir = select_path("Select the directory to save the blended model")
 
-primary_model = load_model(primary_model_path)
-secondary_model = load_model(secondary_model_path)
-# Call the function to pad state dictionaries as needed
-pad_state_dicts_with_different_tensors(primary_model['state_dict'], secondary_model['state_dict'])
+def main():
+    args = parse_args()
+    if not 0.0 <= args.t <= 1.0:
+        raise ValueError("--t must be between 0.0 and 1.0.")
 
-v0 = primary_model['state_dict']
-v1 = secondary_model['state_dict']
+    init(autoreset=True)
+    if not args.no_clear:
+        clear_console()
+    print(f"{Fore.YELLOW}Starting {Fore.GREEN}spherical linear interpolation{Fore.YELLOW} script, please wait...{Style.RESET_ALL}")
 
-# Interpolating Parameters
-for key in set(v0.keys()).union(set(v1.keys())):
-    if key in v0 and key in v1:
-        # Check if both values are tensors
-        if isinstance(v0[key], torch.Tensor) and isinstance(v1[key], torch.Tensor):
-            v0[key] = slerp((float(1.0) - 0.5), v0[key], v1[key])
-        else:
-            print(f"Skipping key {key} because it does not point to tensors.")
-    if key in v1 and key not in v0:
-        v0[key] = v1[key]
-        del v1[key]
+    primary_model_path, secondary_model_path, blended_model_savedir = resolve_input_paths(args)
 
-del secondary_model
+    primary_model = load_model(primary_model_path)
+    secondary_model = load_model(secondary_model_path)
+    # Call the function to pad state dictionaries as needed
+    pad_state_dicts_with_different_tensors(primary_model['state_dict'], secondary_model['state_dict'])
 
-print(f"{Fore.YELLOW}\nCopying necessary files and saving blended model to: {blended_model_savedir}{Style.RESET_ALL}")
+    v0 = primary_model['state_dict']
+    v1 = secondary_model['state_dict']
 
-for key, value in v0.items():
-    if isinstance(value, np.ndarray):
-        v0[key] = torch.tensor(value)
+    # Interpolating Parameters
+    for key in set(v0.keys()).union(set(v1.keys())):
+        if key in v0 and key in v1:
+            # Check if both values are tensors
+            if isinstance(v0[key], torch.Tensor) and isinstance(v1[key], torch.Tensor):
+                v0[key] = slerp(args.t, v0[key], v1[key])
+            else:
+                print(f"Skipping key {key} because it does not point to tensors.")
+        if key in v1 and key not in v0:
+            v0[key] = v1[key]
+            del v1[key]
 
-resulting_vocab_size = primary_model['state_dict']['model.embed_tokens.weight'].size(0)
+    del secondary_model
 
-config = AutoConfig.from_pretrained(primary_model_path)
-if config.vocab_size != resulting_vocab_size:
-    print(f"Updating config vocab size from {config.vocab_size} to {resulting_vocab_size}")
-    config.vocab_size = resulting_vocab_size
+    print(f"{Fore.YELLOW}\nCopying necessary files and saving blended model to: {blended_model_savedir}{Style.RESET_ALL}")
 
-model = AutoModelForCausalLM.from_config(config)
+    for key, value in v0.items():
+        if isinstance(value, np.ndarray):
+            v0[key] = torch.tensor(value)
 
-model.load_state_dict(primary_model['state_dict'])
-model.save_pretrained(blended_model_savedir, max_shard_size="20000MiB")
+    resulting_vocab_size = primary_model['state_dict']['model.embed_tokens.weight'].size(0)
 
-#save_model_path = blended_model_savedir + '/pytorch_model.bin'
-#save_model(primary_model, save_model_path)
+    config = AutoConfig.from_pretrained(primary_model_path)
+    if config.vocab_size != resulting_vocab_size:
+        print(f"Updating config vocab size from {config.vocab_size} to {resulting_vocab_size}")
+        config.vocab_size = resulting_vocab_size
 
-# List of files to copy to merged model dir
-files_to_copy = ["special_tokens_map.json", "tokenizer_config.json", "vocab.json", "tokenizer.model", "generation_config.json", "added_tokens.json", "merges.txt"]
-            
-# Check for the existence of 'special_tokens_map.json' in both directories
-first_model_has_special_tokens = os.path.exists(os.path.join(primary_model_path, "special_tokens_map.json"))
-second_model_has_special_tokens = os.path.exists(os.path.join(secondary_model_path, "special_tokens_map.json"))
-            
-# Decide the source directory based on the presence of 'special_tokens_map.json'
-if first_model_has_special_tokens and not second_model_has_special_tokens:
-    src_dir = primary_model_path
-elif second_model_has_special_tokens or not first_model_has_special_tokens:
-    src_dir = secondary_model_path
-            
-# Copy each file to the new folder
-for filename in files_to_copy:
-    src_path = os.path.join(src_dir, filename)
-    dst_path = os.path.join(blended_model_savedir, filename)
-    print(f"\nCopying files from dir: {src_path}")
-    print(f"To dir: {dst_path}")
-    try:
-        shutil.copy2(src_path, dst_path)
-    except FileNotFoundError:
-        print("\nFile " + filename + " not found in " + src_dir + ". Skipping (likely not important).")  
+    model = AutoModelForCausalLM.from_config(config)
+
+    if (
+        "lm_head.weight" not in primary_model["state_dict"]
+        and "model.embed_tokens.weight" in primary_model["state_dict"]
+    ):
+        # Some model families tie lm_head to input embeddings and omit lm_head in checkpoints.
+        primary_model["state_dict"]["lm_head.weight"] = primary_model["state_dict"]["model.embed_tokens.weight"]
+
+    missing_keys, unexpected_keys = model.load_state_dict(primary_model['state_dict'], strict=False)
+    if missing_keys:
+        print(f"Warning: Missing keys after load_state_dict (strict=False): {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys after load_state_dict (strict=False): {unexpected_keys}")
+    model.tie_weights()
+    model.save_pretrained(blended_model_savedir, max_shard_size="20000MB")
+
+    # List of files to copy to merged model dir
+    files_to_copy = [
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "tokenizer.model",
+        "generation_config.json",
+        "added_tokens.json",
+        "merges.txt",
+    ]
+
+    # Check for the existence of 'special_tokens_map.json' in both directories
+    first_model_has_special_tokens = os.path.exists(os.path.join(primary_model_path, "special_tokens_map.json"))
+    second_model_has_special_tokens = os.path.exists(os.path.join(secondary_model_path, "special_tokens_map.json"))
+
+    # Decide the source directory based on the presence of 'special_tokens_map.json'
+    if first_model_has_special_tokens and not second_model_has_special_tokens:
+        src_dir = primary_model_path
+    elif second_model_has_special_tokens or not first_model_has_special_tokens:
+        src_dir = secondary_model_path
+
+    # Copy each file to the new folder
+    for filename in files_to_copy:
+        src_path = os.path.join(src_dir, filename)
+        dst_path = os.path.join(blended_model_savedir, filename)
+        print(f"\nCopying files from dir: {src_path}")
+        print(f"To dir: {dst_path}")
+        try:
+            shutil.copy2(src_path, dst_path)
+        except FileNotFoundError:
+            print("\nFile " + filename + " not found in " + src_dir + ". Skipping (likely not important).")
+
+
+if __name__ == "__main__":
+    main()
